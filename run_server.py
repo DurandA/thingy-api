@@ -11,13 +11,6 @@ from dateutil.parser import parse
 
 loop = asyncio.get_event_loop()
 
-def json_error(status, message=None):
-    return json_response({
-      "error": {
-        "code": status,
-        "message": message
-      }
-    }, status=status)
 
 async def devices(request):
     redis = request.app['redis']
@@ -116,7 +109,7 @@ async def init(loop):
     app.router.add_route('*', '/{thingy_id}/sensors/{sensor:temperature|pressure|humidity|gas|color}', TSensorView)
     app.router.add_route('get', '/{thingy_id}/sensors/{sensor:button}', SensorView)
 
-    app.router.add_get('/{device_id}/led', led)
+    app.router.add_get('/{device_id}/actuators/led', led)
     app.router.add_get('/{device_id}/setup', setup)
 
     srv = await loop.create_server(app.make_handler(), '127.0.0.1', 8080)
