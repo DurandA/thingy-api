@@ -1,6 +1,6 @@
 import asyncio
 from aiohttp import web
-from aiohttp.web import Application, Response, json_response, HTTPNotFound, View
+from aiohttp.web import Application, Response, json_response, View, HTTPUnprocessableEntity, HTTPNotFound
 from aiohttp_sse import sse_response
 import aioredis
 
@@ -20,17 +20,17 @@ async def devices(request):
 class ABCSensorView(View):
     def __init__(self, request):
         super().__init__(request)
-        self.thingy_id = request.match_info['thingy_id']
+        self.thingy_uuid = request.match_info['thingy_uuid']
         self.sensor = request.match_info.get('sensor')
         self.redis = request.app['redis']
 
 class TSensorView(ABCSensorView):
     async def get(self):
-        val = await self.redis.zrange(self.thingy_id+':'+self.sensor, -1, -1)
+        val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
         try:
             return json_response(body=val[0])
         except IndexError:
-            return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_id))
+            return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid))
 
     async def post(self):
         data = await self.request.json()
@@ -43,25 +43,25 @@ class TSensorView(ABCSensorView):
         tr = self.redis.multi_exec()
         try:
             for sensor in data['sensors']:
-                tr.zadd(self.thingy_id+':'+sensor, timestamp, dumps(data))
+                tr.zadd(self.thingy_uuid+':'+sensor, timestamp, dumps(data))
         except KeyError:
             return HTTPUnprocessableEntity(text="Missing data for sensors field.")
-        tr.sadd('thingy', self.thingy_id)
+        tr.sadd('thingy', self.thingy_uuid)
         await tr.execute()
         return json_response(data)
 
 class SensorView(ABCSensorView):
     async def get(self):
-        val = await self.redis.get(self.thingy_id+':'+self.sensor)
+        val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
         if not val:
-            return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_id)) #TODO wrong type
+            return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid)) #TODO wrong type
         return json_response(body=val)
 
     async def put(self):
         data = await self.request.json()
         tr = self.redis.multi_exec()
-        tr.set(self.thingy_id+':'+self.sensor, dumps(data))
-        tr.sadd('thingy', self.thingy_id)
+        tr.set(self.thingy_uuid+':'+self.sensor, dumps(data))
+        tr.sadd('thingy', self.thingy_uuid)
         await tr.execute()
         return json_response(data)
 
@@ -105,12 +105,12 @@ async def init(loop):
 
     app.router.add_get('/', devices)
 
-    app.router.add_route('post', '/{thingy_id}/sensors/', SensorView)
-    app.router.add_route('*', '/{thingy_id}/sensors/{sensor:temperature|pressure|humidity|gas|color}', TSensorView)
-    app.router.add_route('get', '/{thingy_id}/sensors/{sensor:button}', SensorView)
+    app.router.add_route('post', '/{thingy_uuid}/sensors/', TSensorView)
+    app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:temperature|pressure|humidity|gas|color}', TSensorView)
+    app.router.add_route('*', '/{thingy_uuid}/sensors/{sensor:button}', SensorView)
 
-    app.router.add_get('/{device_id}/actuators/led', led)
-    app.router.add_get('/{device_id}/setup', setup)
+    app.router.add_get('/{thingy_uuid}/actuators/led', led)
+    app.router.add_get('/{thingy_uuid}/setup', setup)
 
     srv = await loop.create_server(app.make_handler(), '127.0.0.1', 8080)
     return srv
