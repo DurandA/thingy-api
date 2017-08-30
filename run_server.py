@@ -89,7 +89,7 @@ class LEDCycle(object):
 led_cycle = LEDCycle()
 
 async def led(request):
-    if request.headers.get('EXPECT') == 'text/event-stream':
+    if request.headers.get('Accept') == 'text/event-stream':
         async with sse_response(request) as resp:
             while True:
                 await asyncio.sleep(1, loop=loop)
