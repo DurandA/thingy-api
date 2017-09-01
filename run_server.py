@@ -1,11 +1,11 @@
 import asyncio
 from aiohttp import web
 from aiohttp.web import Application, Response, json_response, View, HTTPUnprocessableEntity, HTTPNotFound
+import aiohttp_cors
 from aiohttp_sse import sse_response
 import aioredis
 
 from json import dumps
-from collections import defaultdict
 from itertools import cycle
 from dateutil.parser import parse
 
@@ -102,15 +102,24 @@ async def init(loop):
     app = web.Application(loop=loop)
     app['redis'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
+    # Configure default CORS settings.
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+            )
+    })
 
-    app.router.add_get('/', devices)
+    cors.add(app.router.add_get('/', devices))
 
-    app.router.add_route('post', '/{thingy_uuid}/sensors/', TSensorView)
-    app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:temperature|pressure|humidity|gas|color}', TSensorView)
-    app.router.add_route('*', '/{thingy_uuid}/sensors/{sensor:button}', SensorView)
+    cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:temperature|pressure|humidity|gas|color}', TSensorView))
+    cors.add(app.router.add_route('post', '/{thingy_uuid}/sensors/', TSensorView))
+    cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
+    cors.add(app.router.add_route('put', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
 
-    app.router.add_get('/{thingy_uuid}/actuators/led', led)
-    app.router.add_get('/{thingy_uuid}/setup', setup)
+    cors.add(app.router.add_get('/{thingy_uuid}/actuators/led', led))
+    cors.add(app.router.add_get('/{thingy_uuid}/setup', setup))
 
     srv = await loop.create_server(app.make_handler(), '127.0.0.1', 8080)
     return srv
