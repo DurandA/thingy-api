@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 from aiohttp import web
 from aiohttp.web import Application, Response, json_response, View, HTTPUnprocessableEntity, HTTPNotFound
