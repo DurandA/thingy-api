@@ -2,3 +2,4 @@ aiohttp==2.2.5
 aiohttp-cors==0.5.3
 aioredis==0.3.3
 aiohttp-sse==1.1.0
+python-dateutil==2.6.0
