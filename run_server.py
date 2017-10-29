@@ -9,6 +9,7 @@ import aioredis
 from json import dumps
 from itertools import cycle
 from dateutil.parser import parse
+import re
 
 loop = asyncio.get_event_loop()
 
@@ -25,26 +26,48 @@ class ABCSensorView(View):
         self.sensor = request.match_info.get('sensor')
         self.redis = request.app['redis']
 
-    async def subscribe_sensor(self, ws):
+class Event(View):
+    ev = asyncio.Event()
+
+    def __init__(self, request):
+        super().__init__(request)
+        self.thingy_uuid = request.match_info['thingy_uuid']
+        self.sensor = request.match_info.get('sensor')
+
+    async def get(self):
+        ws = web.WebSocketResponse()
+        if not ws.can_prepare(self.request):
+            return
         await ws.prepare(self.request)
-        sub = self.request.app['sub']
-        ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
-        while (await ch.wait_message()):
-            data = await ch.get_json()
+        async for topic, data in self:
+            m = re.match(r'{}.sensors.{}'.format(self.thingy_uuid, self.sensor or '(\w+)'), topic.decode())
+            if not m:
+                continue
             await ws.send_json(data)
         return ws
 
-class TSensorView(ABCSensorView):
+    async def subscribe_sensors(redis):
+        ch = (await redis.psubscribe('*.sensors.*'))[0]
+        while (await ch.wait_message()):
+            Event.data = await ch.get_json()
+            Event.ev.set()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self.ev.wait()
+        self.ev.clear()
+        return self.data
+
+class TSensorView(ABCSensorView, Event):
     async def get(self):
-        ws = web.WebSocketResponse()
-        if ws.can_prepare(self.request):
-            await self.subscribe_sensor(ws)
-        else:
-            val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
-            try:
-                return json_response(body=val[0])
-            except IndexError:
-                return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid))
+        await super().get()
+        val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
+        try:
+            return json_response(body=val[0])
+        except IndexError:
+            return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid))
 
     async def post(self):
         data = await self.request.json()
@@ -58,7 +81,7 @@ class TSensorView(ABCSensorView):
         try:
             for sensor in data['sensors']:
                 tr.zadd(self.thingy_uuid+':'+sensor, timestamp, dumps(data))
-                self.redis.publish_json(self.thingy_uuid+':'+sensor, data)
+                self.redis.publish_json(self.thingy_uuid+'.sensors.'+sensor, data)
         except KeyError:
             return HTTPUnprocessableEntity(text="Missing data for sensors field.")
         tr.sadd('thingy', self.thingy_uuid)
@@ -67,20 +90,17 @@ class TSensorView(ABCSensorView):
 
 class SensorView(ABCSensorView):
     async def get(self):
-        ws = web.WebSocketResponse()
-        if ws.can_prepare(self.request):
-            await self.subscribe_sensor(ws)
-        else:
-            val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
-            if not val:
-                return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid)) #TODO wrong type
-            return json_response(body=val)
+        await super().get()
+        val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
+        if not val:
+            return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid)) #TODO wrong type
+        return json_response(body=val)
 
     async def put(self):
         data = await self.request.json()
         tr = self.redis.multi_exec()
         tr.set(self.thingy_uuid+':'+self.sensor, dumps(data))
-        self.redis.publish_json(self.thingy_uuid+':'+self.sensor, data)
+        self.redis.publish_json(self.thingy_uuid+'.sensors.'+self.sensor, data)
         tr.sadd('thingy', self.thingy_uuid)
         await tr.execute()
         return json_response(data)
@@ -146,6 +166,8 @@ async def init(loop):
             ('localhost', 6379), encoding='utf-8', loop=loop)
     app['sub'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
+    asyncio.ensure_future(Event.subscribe_sensors(app['sub']))
+
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
         "*": aiohttp_cors.ResourceOptions(
@@ -162,6 +184,7 @@ async def init(loop):
     cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
     cors.add(app.router.add_route('put', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
 
+    cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/ws', Event))
     cors.add(app.router.add_get('/{thingy_uuid}/actuators/led', led))
     cors.add(app.router.add_get('/{thingy_uuid}/setup', setup))
 
