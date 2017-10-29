@@ -26,11 +26,21 @@ class ABCSensorView(View):
 
 class TSensorView(ABCSensorView):
     async def get(self):
-        val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
-        try:
-            return json_response(body=val[0])
-        except IndexError:
-            return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid))
+        ws = web.WebSocketResponse()
+        if ws.can_prepare(self.request):
+            await ws.prepare(self.request)
+            sub = self.request.app['sub']
+            ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
+            while (await ch.wait_message()):
+                data = await ch.get_json()
+                await ws.send_json(data)
+            return ws
+        else:
+            val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
+            try:
+                return json_response(body=val[0])
+            except IndexError:
+                return HTTPNotFound(text='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid))
 
     async def post(self):
         data = await self.request.json()
@@ -44,6 +54,7 @@ class TSensorView(ABCSensorView):
         try:
             for sensor in data['sensors']:
                 tr.zadd(self.thingy_uuid+':'+sensor, timestamp, dumps(data))
+                self.redis.publish_json(self.thingy_uuid+':'+sensor, data)
         except KeyError:
             return HTTPUnprocessableEntity(text="Missing data for sensors field.")
         tr.sadd('thingy', self.thingy_uuid)
@@ -52,15 +63,26 @@ class TSensorView(ABCSensorView):
 
 class SensorView(ABCSensorView):
     async def get(self):
-        val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
-        if not val:
-            return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid)) #TODO wrong type
-        return json_response(body=val)
+        ws = web.WebSocketResponse()
+        if ws.can_prepare(self.request):
+            await ws.prepare(self.request)
+            sub = self.request.app['sub']
+            ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
+            while (await ch.wait_message()):
+                data = await ch.get_json()
+                await ws.send_json(data)
+            return ws
+        else:
+            val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
+            if not val:
+                return HTTPNotFound(reason='No {} sensor data found for {}'.format(self.sensor, self.thingy_uuid)) #TODO wrong type
+            return json_response(body=val)
 
     async def put(self):
         data = await self.request.json()
         tr = self.redis.multi_exec()
         tr.set(self.thingy_uuid+':'+self.sensor, dumps(data))
+        self.redis.publish_json(self.thingy_uuid+':'+self.sensor, data)
         tr.sadd('thingy', self.thingy_uuid)
         await tr.execute()
         return json_response(data)
@@ -75,7 +97,6 @@ async def setup(request):
     })
 
 class LEDCycle(object):
-
     def __init__(self, interval=1.):
         self.color_cycle = cycle(range(1,9))
         self.interval = interval
@@ -124,6 +145,8 @@ async def led(request):
 async def init(loop):
     app = web.Application(loop=loop)
     app['redis'] = await aioredis.create_redis(
+            ('localhost', 6379), encoding='utf-8', loop=loop)
+    app['sub'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
