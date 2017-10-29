@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import asyncio
 from aiohttp import web
 from aiohttp.web import Application, Response, json_response, View, HTTPUnprocessableEntity, HTTPNotFound
@@ -77,8 +76,18 @@ async def setup(request):
 
 class LEDCycle(object):
 
-    def __init__(self):
+    def __init__(self, interval=1.):
         self.color_cycle = cycle(range(1,9))
+        self.interval = interval
+        self.tick = asyncio.Event()
+        asyncio.ensure_future(self.clock())
+
+    async def clock(self):
+        while True:
+            self.tick.clear()
+            await asyncio.sleep(self.interval)
+            self.led = self.__next__()
+            self.tick.set()
 
     def __next__(self):
         return {
@@ -87,17 +96,30 @@ class LEDCycle(object):
             'delay': 1000
         }
 
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        await self.tick.wait()
+        return self.led
+
 led_cycle = LEDCycle()
 
 async def led(request):
-    if request.headers.get('Accept') == 'text/event-stream':
-        async with sse_response(request) as resp:
-            while True:
-                await asyncio.sleep(1, loop=loop)
-                resp.send(dumps(next(led_cycle)))
-        return resp
+    ws = web.WebSocketResponse()
+    if ws.can_prepare(request):
+        await ws.prepare(request)
+        async for led in led_cycle:
+            await ws.send_json(led)
+        return ws
     else:
-        return json_response(next(led_cycle))
+        if request.headers.get('Accept') == 'text/event-stream':
+            async with sse_response(request) as resp:
+                async for led in led_cycle:
+                    resp.send(dumps(led))
+            return resp
+        else:
+            return json_response(next(led_cycle))
 
 async def init(loop):
     app = web.Application(loop=loop)
