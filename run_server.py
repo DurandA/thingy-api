@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import asyncio
 from aiohttp import web
 from aiohttp.web import Application, Response, json_response, View, HTTPUnprocessableEntity, HTTPNotFound
@@ -24,17 +25,20 @@ class ABCSensorView(View):
         self.sensor = request.match_info.get('sensor')
         self.redis = request.app['redis']
 
+    async def subscribe_sensor(self, ws):
+        await ws.prepare(self.request)
+        sub = self.request.app['sub']
+        ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
+        while (await ch.wait_message()):
+            data = await ch.get_json()
+            await ws.send_json(data)
+        return ws
+
 class TSensorView(ABCSensorView):
     async def get(self):
         ws = web.WebSocketResponse()
         if ws.can_prepare(self.request):
-            await ws.prepare(self.request)
-            sub = self.request.app['sub']
-            ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
-            while (await ch.wait_message()):
-                data = await ch.get_json()
-                await ws.send_json(data)
-            return ws
+            await self.subscribe_sensor(ws)
         else:
             val = await self.redis.zrange(self.thingy_uuid+':'+self.sensor, -1, -1)
             try:
@@ -65,13 +69,7 @@ class SensorView(ABCSensorView):
     async def get(self):
         ws = web.WebSocketResponse()
         if ws.can_prepare(self.request):
-            await ws.prepare(self.request)
-            sub = self.request.app['sub']
-            ch = (await sub.subscribe(self.thingy_uuid+':'+self.sensor))[0]
-            while (await ch.wait_message()):
-                data = await ch.get_json()
-                await ws.send_json(data)
-            return ws
+            await self.subscribe_sensor(ws)
         else:
             val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
             if not val:
