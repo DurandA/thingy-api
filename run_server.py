@@ -39,26 +39,26 @@ class Event(View):
         if not ws.can_prepare(self.request):
             return
         await ws.prepare(self.request)
-        async for topic, data in self:
-            m = re.match(r'{}.sensors.{}'.format(self.thingy_uuid, self.sensor or '(\w+)'), topic.decode())
-            if not m:
-                continue
+        async for data in self:
             await ws.send_json(data)
         return ws
 
-    async def subscribe_sensors(redis):
+    async def subscribe(redis):
         ch = (await redis.psubscribe('*.sensors.*'))[0]
         while (await ch.wait_message()):
-            Event.data = await ch.get_json()
+            Event.message = await ch.get_json()
             Event.ev.set()
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        await self.ev.wait()
-        self.ev.clear()
-        return self.data
+        while True:
+            await self.ev.wait()
+            self.ev.clear()
+            ch, data = self.message
+            if re.match(r'{}.sensors.{}'.format(self.thingy_uuid, self.sensor or '(\w+)'), ch.decode()):
+                return data
 
 class TSensorView(ABCSensorView, Event):
     async def get(self):
@@ -88,7 +88,7 @@ class TSensorView(ABCSensorView, Event):
         await tr.execute()
         return json_response(data)
 
-class SensorView(ABCSensorView):
+class SensorView(ABCSensorView, Event):
     async def get(self):
         await super().get()
         val = await self.redis.get(self.thingy_uuid+':'+self.sensor)
@@ -114,55 +114,62 @@ async def setup(request):
         'gas': {'mode': 1}
     })
 
-class LEDActuator(object):
-    def __init__(self, thingy_uuid, redis):
-        self.ch = None
-        self.thingy_uuid = thingy_uuid
-        self.redis = redis
+class LED(View):
+    ev = asyncio.Event()
+
+    def __init__(self, request):
+        super().__init__(request)
+        self.thingy_uuid = request.match_info['thingy_uuid']
+        self.redis = request.app['redis']
+        self.echoes = 0
+
+    async def get(self):
+        ws = web.WebSocketResponse()
+        if ws.can_prepare(self.request):
+            await ws.prepare(self.request)
+            async for led in self:
+                await ws.send_json(led)
+            return ws
+        else:
+            if self.request.headers.get('Accept') == 'text/event-stream':
+                async with sse_response(self.request) as resp:
+                    async for led in self:
+                        resp.send(dumps(led))
+                return resp
+            else:
+                async for led in self:
+                    return json_response(led)
+
+    async def put(self):
+        data = await self.request.json()
+        await self.redis.publish_json(self.thingy_uuid+'.actuators.led', data)
+        return json_response(data)
+
+    async def subscribe(redis):
+        ch = (await redis.psubscribe('*.actuators.led'))[0]
+        while (await ch.wait_message()):
+            LED.message = await ch.get_json()
+            LED.ev.set()
 
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        if self.ch is None:
-            self.ch = (await self.redis.subscribe(self.thingy_uuid+'.actuators.led'))[0]
+        if self.echoes <3:
+            if self.echoes:
+                await asyncio.sleep(1.)
+            self.echoes += 1
             return {
-                'color': 1,
+                'color': self.echoes,
                 'intensity': 20,
                 'delay': 1000
             }
-        await self.ch.wait_message()
-        return await self.ch.get_json()
-
-class LEDView(View):
-    def __init__(self, request):
-        super().__init__(request)
-        self.thingy_uuid = request.match_info['thingy_uuid']
-        self.redis = request.app['redis']
-        self.sub = request.app['sub']
-
-    async def get(self):
-        actuator = LEDActuator(self.thingy_uuid, self.sub)
-        ws = web.WebSocketResponse()
-        if ws.can_prepare(self.request):
-            await ws.prepare(self.request)
-            async for led in actuator:
-                await ws.send_json(led)
-            return ws
-        else:
-            if self.request.headers.get('Accept') == 'text/event-stream':
-                async with sse_response(request) as resp:
-                    async for led in actuator:
-                        resp.send(dumps(led))
-                return resp
-            else:
-                async for led in actuator:
-                    return json_response(led)
-
-    async def post(self):
-        data = await self.request.json()
-        await self.redis.publish_json(self.thingy_uuid+'.actuators.led', data)
-        return json_response(data)
+        while True:
+            await self.ev.wait()
+            self.ev.clear()
+            ch, data = self.message
+            if re.match(r'{}.actuators.led'.format(self.thingy_uuid), ch.decode()):
+                return data
 
 async def init(loop):
     app = web.Application(loop=loop)
@@ -170,7 +177,8 @@ async def init(loop):
             ('localhost', 6379), encoding='utf-8', loop=loop)
     app['sub'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
-    asyncio.ensure_future(Event.subscribe_sensors(app['sub']))
+    asyncio.ensure_future(Event.subscribe(app['sub']))
+    asyncio.ensure_future(LED.subscribe(app['sub']))
 
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
@@ -187,8 +195,8 @@ async def init(loop):
     cors.add(app.router.add_route('post', '/{thingy_uuid}/sensors/', TSensorView))
     cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
     cors.add(app.router.add_route('put', '/{thingy_uuid}/sensors/{sensor:button}', SensorView))
-    cors.add(app.router.add_route('get', '/{thingy_uuid}/actuators/led', LEDView))
-    cors.add(app.router.add_route('post', '/{thingy_uuid}/actuators/led', LEDView))
+    cors.add(app.router.add_route('get', '/{thingy_uuid}/actuators/led', LED))
+    cors.add(app.router.add_route('put', '/{thingy_uuid}/actuators/led', LED))
 
     cors.add(app.router.add_route('get', '/{thingy_uuid}/sensors/ws', Event))
 
