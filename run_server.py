@@ -9,7 +9,7 @@ import aioredis
 from json import dumps
 from itertools import cycle
 from dateutil.parser import parse
-import re
+import re, functools
 
 loop = asyncio.get_event_loop()
 
@@ -114,9 +114,24 @@ async def setup(request):
         'gas': {'mode': 1}
     })
 
-class LED(View):
-    fut = None
+def anext_subscriber():
+    future = None
+    def decorator(anext):
+        @functools.wraps(anext)
+        async def wrapper(self):
+            nonlocal future
+            if future is not None:
+                return await anext(self, future)
+            future = loop.create_future()
+            msg = self.ch.get_json()
+            msg = await anext(self, msg)
+            fut, future = future, None
+            fut.set_result(msg)
+            return msg
+        return wrapper
+    return decorator
 
+class LED(View):
     def __init__(self, request):
         super().__init__(request)
         self.thingy_uuid = request.match_info['thingy_uuid']
@@ -128,17 +143,17 @@ class LED(View):
         ws = web.WebSocketResponse()
         if ws.can_prepare(self.request):
             await ws.prepare(self.request)
-            async for led in self:
+            async for ch, led in self:
                 await ws.send_json(led)
             return ws
         else:
             if self.request.headers.get('Accept') == 'text/event-stream':
                 async with sse_response(self.request) as resp:
-                    async for led in self:
+                    async for ch, led in self:
                         resp.send(dumps(led))
                 return resp
             else:
-                async for led in self:
+                async for ch, led in self:
                     return json_response(led)
 
     async def put(self):
@@ -149,29 +164,21 @@ class LED(View):
     def __aiter__(self):
         return self
 
-    async def __anext__(self):
-        async def get_msg(self):
-            if LED.fut is not None:
-                return await LED.fut
-            LED.fut = loop.create_future()
-            msg = await self.ch.get_json()
-            fut, LED.fut = LED.fut, None
-            fut.set_result(msg)
-            return msg
-        
+    @anext_subscriber()
+    async def __anext__(self, msg):
         if self.blinks <3:
             if self.blinks:
                 await asyncio.sleep(1.)
             self.blinks += 1
-            return {
+            return None, {
                 'color': self.blinks,
                 'intensity': 20,
                 'delay': 1000
             }
         while True:
-            ch, data = await get_msg(self)
+            ch, data = await msg
             if re.match(r'{}.actuators.led'.format(self.thingy_uuid), ch.decode()):
-                return data
+                return ch, data
 
 async def init(loop):
     app = web.Application(loop=loop)
