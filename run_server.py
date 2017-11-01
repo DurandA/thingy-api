@@ -12,7 +12,7 @@ from dateutil.parser import parse
 import re, functools
 
 loop = asyncio.get_event_loop()
-
+led_channel = loop.create_future()
 
 async def devices(request):
     redis = request.app['redis']
@@ -114,7 +114,7 @@ async def setup(request):
         'gas': {'mode': 1}
     })
 
-def anext_subscriber():
+def anext_subscriber(channel):
     future = None
     def decorator(anext):
         @functools.wraps(anext)
@@ -123,7 +123,7 @@ def anext_subscriber():
             if future is not None:
                 return await anext(self, future)
             future = loop.create_future()
-            msg = self.ch.get_json()
+            msg = (await channel).get_json()
             msg = await anext(self, msg)
             fut, future = future, None
             fut.set_result(msg)
@@ -132,11 +132,11 @@ def anext_subscriber():
     return decorator
 
 class LED(View):
+    ch = None
     def __init__(self, request):
         super().__init__(request)
         self.thingy_uuid = request.match_info['thingy_uuid']
         self.redis = request.app['redis']
-        self.ch = request.app['led_channel']
         self.blinks = 0
 
     async def get(self):
@@ -164,7 +164,7 @@ class LED(View):
     def __aiter__(self):
         return self
 
-    @anext_subscriber()
+    @anext_subscriber(led_channel)
     async def __anext__(self, msg):
         if self.blinks <3:
             if self.blinks:
@@ -187,7 +187,7 @@ async def init(loop):
     app['sub'] = sub = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
     asyncio.ensure_future(Event.subscribe(app['sub']))
-    app['led_channel'] = (await sub.psubscribe('*.actuators.led'))[0]
+    led_channel.set_result((await sub.psubscribe('*.actuators.led'))[0])
 
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
