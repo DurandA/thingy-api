@@ -6,10 +6,13 @@ import aiohttp_cors
 from aiohttp_sse import sse_response
 import aioredis
 
+from aioreactive.core import AsyncAnonymousObserver, AsyncStream, AsyncIteratorObserver, subscribe, Operators as op
+
 from json import dumps
 from itertools import cycle
 from dateutil.parser import parse
 import re, functools
+
 
 loop = asyncio.get_event_loop()
 led_channel = loop.create_future()
@@ -114,80 +117,58 @@ async def setup(request):
         'gas': {'mode': 1}
     })
 
-def anext_subscriber(channel):
-    future = None
-    def decorator(anext):
-        @functools.wraps(anext)
-        async def wrapper(self):
-            nonlocal future
-            if future is not None:
-                return await anext(self, future)
-            future = loop.create_future()
-            msg = (await channel).get_json()
-            msg = await anext(self, msg)
-            fut, future = future, None
-            fut.set_result(msg)
-            return msg
-        return wrapper
-    return decorator
-
 class LED(View):
     ch = None
     def __init__(self, request):
         super().__init__(request)
         self.thingy_uuid = request.match_info['thingy_uuid']
         self.redis = request.app['redis']
+        uuid_filter = lambda ch: re.match(r'{}.actuators.led'.format(self.thingy_uuid), ch)
+        self.stream = (request.app['leds_stream']
+                        | op.filter(lambda x: uuid_filter(x[0].decode()))
+                        | op.map(lambda x: x[1])
+                        )
         self.blinks = 0
 
     async def get(self):
-        ws = web.WebSocketResponse()
-        if ws.can_prepare(self.request):
-            await ws.prepare(self.request)
-            async for ch, led in self:
-                await ws.send_json(led)
-            return ws
-        else:
-            if self.request.headers.get('Accept') == 'text/event-stream':
-                async with sse_response(self.request) as resp:
-                    async for ch, led in self:
-                        resp.send(dumps(led))
-                return resp
+        obv = AsyncIteratorObserver()
+        async with subscribe(self.stream, obv) as subscription:
+            ws = web.WebSocketResponse()
+            if ws.can_prepare(self.request):
+                await ws.prepare(self.request)
+                async for led in obv:
+                    await ws.send_json(led)
+                return ws
             else:
-                async for ch, led in self:
-                    return json_response(led)
+                if self.request.headers.get('Accept') == 'text/event-stream':
+                    async with sse_response(self.request) as resp:
+                        async for led in obv:
+                            resp.send(dumps(led))
+                        return resp
+                else:
+                    return json_response(await obv.__anext__())
 
     async def put(self):
         data = await self.request.json()
         await self.redis.publish_json(self.thingy_uuid+'.actuators.led', data)
         return json_response(data)
 
-    def __aiter__(self):
-        return self
-
-    @anext_subscriber(led_channel)
-    async def __anext__(self, msg):
-        if self.blinks <3:
-            if self.blinks:
-                await asyncio.sleep(1.)
-            self.blinks += 1
-            return None, {
-                'color': self.blinks,
-                'intensity': 20,
-                'delay': 1000
-            }
-        while True:
-            ch, data = await msg
-            if re.match(r'{}.actuators.led'.format(self.thingy_uuid), ch.decode()):
-                return ch, data
-
 async def init(loop):
     app = web.Application(loop=loop)
     app['redis'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
-    app['sub'] = sub = await aioredis.create_redis(
+    sub = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
-    asyncio.ensure_future(Event.subscribe(app['sub']))
-    led_channel.set_result((await sub.psubscribe('*.actuators.led'))[0])
+
+    schan, lchan = await sub.psubscribe('*.sensors.*', '*.actuators.led')
+    app['sensors_stream'] = sstream = AsyncStream()
+    app['leds_stream'] = lstream = AsyncStream()
+    async def reader(ch, obv):
+        while (await ch.wait_message()):
+            msg = await ch.get_json()
+            await obv.asend(msg)
+    asyncio.ensure_future(reader(schan, sstream))
+    asyncio.ensure_future(reader(lchan, lstream))
 
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
