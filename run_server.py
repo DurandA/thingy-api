@@ -115,13 +115,14 @@ async def setup(request):
     })
 
 class LED(View):
-    ev = asyncio.Event()
+    fut = None
 
     def __init__(self, request):
         super().__init__(request)
         self.thingy_uuid = request.match_info['thingy_uuid']
         self.redis = request.app['redis']
-        self.echoes = 0
+        self.ch = request.app['led_channel']
+        self.blinks = 0
 
     async def get(self):
         ws = web.WebSocketResponse()
@@ -145,29 +146,30 @@ class LED(View):
         await self.redis.publish_json(self.thingy_uuid+'.actuators.led', data)
         return json_response(data)
 
-    async def subscribe(redis):
-        ch = (await redis.psubscribe('*.actuators.led'))[0]
-        while (await ch.wait_message()):
-            LED.message = await ch.get_json()
-            LED.ev.set()
-
     def __aiter__(self):
         return self
 
     async def __anext__(self):
-        if self.echoes <3:
-            if self.echoes:
+        async def get_msg(self):
+            if LED.fut is not None:
+                return await LED.fut
+            LED.fut = loop.create_future()
+            msg = await self.ch.get_json()
+            fut, LED.fut = LED.fut, None
+            fut.set_result(msg)
+            return msg
+
+        if self.blinks <3:
+            if self.blinks:
                 await asyncio.sleep(1.)
-            self.echoes += 1
+            self.blinks += 1
             return {
-                'color': self.echoes,
+                'color': self.blinks,
                 'intensity': 20,
                 'delay': 1000
             }
         while True:
-            await self.ev.wait()
-            self.ev.clear()
-            ch, data = self.message
+            ch, data = await get_msg(self)
             if re.match(r'{}.actuators.led'.format(self.thingy_uuid), ch.decode()):
                 return data
 
@@ -175,10 +177,10 @@ async def init(loop):
     app = web.Application(loop=loop)
     app['redis'] = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
-    app['sub'] = await aioredis.create_redis(
+    app['sub'] = sub = await aioredis.create_redis(
             ('localhost', 6379), encoding='utf-8', loop=loop)
     asyncio.ensure_future(Event.subscribe(app['sub']))
-    asyncio.ensure_future(LED.subscribe(app['sub']))
+    app['led_channel'] = (await sub.psubscribe('*.actuators.led'))[0]
 
     # Configure default CORS settings.
     cors = aiohttp_cors.setup(app, defaults={
@@ -211,3 +213,4 @@ try:
     loop.run_forever()
 except KeyboardInterrupt:
     pass
+
