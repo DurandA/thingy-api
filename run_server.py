@@ -204,8 +204,10 @@ async def init(loop):
 
     cors.add(app.router.add_get('/{thingy_uuid}/setup', setup))
 
-    srv = await loop.create_server(app.make_handler(), '127.0.0.1', 8080)
-    return srv
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8080)
+    await site.start()
 
 loop.run_until_complete(init(loop))
 
